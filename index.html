@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>在线图片修改</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button id="btnImport" class="btn primary">导入图片</button>
+    <div class="tools" id="tools">
+      <button data-tool="erase" class="tool active">抹字</button>
+      <button data-tool="text" class="tool">文字</button>
+      <button data-tool="sticker" class="tool">贴图</button>
+      <button data-tool="pan" class="tool">平移</button>
+    </div>
+    <button id="btnUndo" class="btn" disabled>撤销</button>
+    <button id="btnExport" class="btn primary" disabled>导出</button>
+  </header>
+
+  <main class="stage" id="stage">
+    <canvas id="canvas"></canvas>
+    <div class="empty-hint" id="emptyHint">点「导入图片」开始</div>
+  </main>
+
+  <!-- 文字属性面板 -->
+  <div class="panel" id="textPanel" hidden>
+    <div class="panel-row">
+      <label>文字</label>
+      <input id="textContent" type="text" placeholder="输入文字">
+    </div>
+    <div class="panel-row">
+      <label>字体</label>
+      <select id="textFamily">
+        <option value="sans-serif">无衬线（黑体）</option>
+        <option value="serif">衬线（宋体）</option>
+        <option value="monospace">等宽</option>
+      </select>
+    </div>
+    <div class="panel-row">
+      <label>字重 <span id="textWeightVal">400</span></label>
+      <input id="textWeight" type="range" min="100" max="900" step="100" value="400">
+    </div>
+    <div class="panel-row">
+      <label>字号 <span id="textSizeVal">32</span></label>
+      <input id="textSize" type="range" min="10" max="200" step="1" value="32">
+    </div>
+    <div class="panel-row">
+      <label>颜色</label>
+      <input id="textColor" type="color" value="#000000">
+      <button id="btnPick" class="btn">吸管取色</button>
+    </div>
+    <div class="panel-row">
+      <button id="btnApplyText" class="btn primary full">应用</button>
+    </div>
+  </div>
+
+  <!-- 贴图属性面板 -->
+  <div class="panel" id="stickerPanel" hidden>
+    <div class="panel-row">
+      <label>素材</label>
+      <input id="stickerFile" type="file" accept="image/*">
+    </div>
+    <div class="panel-row">
+      <button id="btnRandomPos" class="btn">换一个位置</button>
+    </div>
+    <p class="hint">拖动画布上的贴图可移动位置</p>
+  </div>
+
+  <input id="fileInput" type="file" accept="image/*" hidden>
+
+  <script src="core.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
