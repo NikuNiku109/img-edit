@@ -8,20 +8,16 @@
   const state = {
     imgW: 0, imgH: 0,
     sourceMime: 'image/jpeg',
-    baseCanvas: null,     // 底图 canvas（原图 + 已抹掉的字）
-    baseCtx: null,
-    display: null,        // 显示 canvas
-    dctx: null,
-    view: { scale: 1, ox: 0, oy: 0 },  // 视图变换
-    tool: 'erase',        // erase | text | sticker | pan
-    layers: [],           // 叠加层对象（文字 / 贴图）
-    selection: null,      // 抹字选区（图像坐标）
-    undoStack: [],        // 抹字撤销栈（区域快照）
-    textSeed: 0,
+    baseCanvas: null, baseCtx: null,
+    view: { scale: 1, ox: 0, oy: 0 },
+    tool: 'erase',            // erase | text | sticker | pan
+    layers: [],
+    selection: null,
+    undoStack: [],
     stickerSeed: 1,
-    activeText: null,     // 正在编辑的文字对象
-    activeSticker: null,  // 正在拖动的贴图对象
-    picking: false,       // 吸管取色模式
+    activeText: null,
+    activeSticker: null,
+    picking: false,
   };
 
   // ---------- DOM ----------
@@ -29,14 +25,10 @@
   const canvas = $('canvas');
   const stage = $('stage');
   const dctx = canvas.getContext('2d');
-  state.display = canvas;
-  state.dctx = dctx;
 
   // ---------- 工具切换 ----------
   document.querySelectorAll('.tool').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      setTool(btn.dataset.tool);
-    });
+    btn.addEventListener('click', () => setTool(btn.dataset.tool));
   });
   function setTool(t) {
     state.tool = t;
@@ -55,17 +47,24 @@
   async function onImport(e) {
     const file = e.target.files[0];
     if (!file) return;
-    state.sourceMime = file.type || 'image/jpeg';
 
-    // EXIF 方向摆正 + 长边 > 4096 先缩小（iOS 18 前 canvas 面积上限约 1600 万像素）
+    // 文件头判断格式（不信 file.type，可能为空或 WebP/HEIC）
+    const head = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+    state.sourceMime = detectImageFormat(head);
+
     let bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
-    const MAX = 4096;
-    if (bitmap.width > MAX || bitmap.height > MAX) {
-      const s = MAX / Math.max(bitmap.width, bitmap.height);
-      const w = Math.round(bitmap.width * s), h = Math.round(bitmap.height * s);
+
+    // 边长 + 面积一起卡
+    const origW = bitmap.width, origH = bitmap.height;
+    const MAX_EDGE = 4096;
+    const s = calcFitScale(origW, origH, MAX_EDGE);
+    let scaledMsg = '';
+    if (s < 1) {
+      const w = Math.round(origW * s), h = Math.round(origH * s);
       const c = document.createElement('canvas'); c.width = w; c.height = h;
       c.getContext('2d').drawImage(bitmap, 0, 0, w, h);
       bitmap = await createImageBitmap(c);
+      scaledMsg = `已从 ${origW}×${origH} 缩到 ${w}×${h}，导出即此尺寸`;
     }
 
     state.imgW = bitmap.width;
@@ -83,28 +82,37 @@
 
     $('emptyHint').hidden = true;
     $('btnExport').disabled = false;
+    if (scaledMsg) alert(scaledMsg);
     fitView();
     render();
   }
 
-  // ---------- 视图变换 ----------
+  // ---------- 视图 ----------
+  // 导入时：重置视图（适配居中）
   function fitView() {
     const r = stage.getBoundingClientRect();
+    canvas.width = Math.round(r.width);
+    canvas.height = Math.round(r.height);
     state.view.scale = Math.min(r.width / state.imgW, r.height / state.imgH) || 1;
     state.view.ox = (r.width - state.imgW * state.view.scale) / 2;
     state.view.oy = (r.height - state.imgH * state.view.scale) / 2;
-    canvas.width = r.width;
-    canvas.height = r.height;
+  }
+  // 尺寸变化（面板开关/旋转）：只改画布尺寸，不动 view（不重置用户缩放）
+  function resizeCanvas() {
+    const r = stage.getBoundingClientRect();
+    const w = Math.round(r.width), h = Math.round(r.height);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+      render();
+    }
+  }
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(resizeCanvas).observe(stage);
   }
 
   function screenToImage(sx, sy) {
     return { x: (sx - state.view.ox) / state.view.scale, y: (sy - state.view.oy) / state.view.scale };
   }
-  function imageToScreen(x, y) {
-    return { x: x * state.view.scale + state.view.ox, y: y * state.view.scale + state.view.oy };
-  }
-
-  window.addEventListener('resize', () => { if (state.imgW) { fitView(); render(); } });
 
   // ---------- 渲染 ----------
   function render() {
@@ -112,10 +120,7 @@
     dctx.clearRect(0, 0, canvas.width, canvas.height);
     dctx.setTransform(state.view.scale, 0, 0, state.view.scale, state.view.ox, state.view.oy);
     dctx.drawImage(state.baseCanvas, 0, 0);
-
     for (const layer of state.layers) drawLayer(layer);
-
-    // 抹字选区框
     if (state.selection && isValidRect(state.selection)) {
       dctx.strokeStyle = '#2f6feb';
       dctx.lineWidth = 2 / state.view.scale;
@@ -142,11 +147,185 @@
     }
   }
 
+  // ---------- 手势层（纯 Pointer Events + pointers Map） ----------
+  const pointers = new Map();
+  let gesture = null;   // 单指操作
+  let pinch = null;     // 双指缩放
+  canvas.style.touchAction = 'none';
+
+  function point(e) {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    pointers.set(e.pointerId, point(e));
+    if (pointers.size === 2) {
+      rollbackGesture();   // 撤销第一指已做的操作（落字/选区/平移/拖贴图）
+      beginPinch();
+      return;
+    }
+    beginSingleFinger(e);
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, point(e));
+    if (pointers.size >= 2) updatePinch();
+    else updateSingleFinger(e);
+  });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 0) commitSingleFinger();
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  function beginSingleFinger(e) {
+    const p = point(e);
+    const img = screenToImage(p.x, p.y);
+
+    if (state.picking) { pickColorAt(img.x, img.y); gesture = { mode: 'pick' }; return; }
+
+    if (state.tool === 'text') {
+      const hit = hitText(img.x, img.y);
+      if (hit) {
+        state.activeText = hit;
+        fillPanelFromActive();
+        $('textPanel').hidden = false;
+        gesture = { mode: 'editText' };
+      } else {
+        const layer = addTextAt(img.x, img.y);
+        gesture = { mode: 'addedText', layer };
+      }
+      return;
+    }
+
+    if (state.tool === 'sticker') {
+      const hit = hitSticker(img.x, img.y);
+      if (hit) {
+        state.activeSticker = hit;
+        gesture = { mode: 'dragSticker', layer: hit, sx: hit.x, sy: hit.y, dx: img.x - hit.x, dy: img.y - hit.y };
+      } else {
+        state.activeSticker = null;
+        gesture = { mode: 'pan', sv: { ...state.view }, sx: p.x, sy: p.y };
+      }
+      render();
+      return;
+    }
+
+    if (state.tool === 'pan') {
+      gesture = { mode: 'pan', sv: { ...state.view }, sx: p.x, sy: p.y };
+      return;
+    }
+
+    // erase：拉矩形选区
+    gesture = { mode: 'select', sx: img.x, sy: img.y };
+    state.selection = null;
+  }
+
+  function updateSingleFinger(e) {
+    if (!gesture) return;
+    const p = point(e);
+    const img = screenToImage(p.x, p.y);
+    if (gesture.mode === 'pan') {
+      state.view.ox = gesture.sv.ox + (p.x - gesture.sx);
+      state.view.oy = gesture.sv.oy + (p.y - gesture.sy);
+      render();
+    } else if (gesture.mode === 'dragSticker') {
+      gesture.layer.x = img.x - gesture.dx;
+      gesture.layer.y = img.y - gesture.dy;
+      render();
+    } else if (gesture.mode === 'select') {
+      state.selection = normalizeRect(gesture.sx, gesture.sy, img.x, img.y, state.imgW, state.imgH);
+      render();
+    }
+  }
+
+  function commitSingleFinger() {
+    if (!gesture) return;
+    if (gesture.mode === 'select') {
+      // 最小边长 8px 防误触
+      if (state.selection && state.selection.w >= 8 && state.selection.h >= 8) {
+        applyErase();
+      } else {
+        state.selection = null;
+        render();
+      }
+    }
+    gesture = null;
+  }
+
+  function rollbackGesture() {
+    if (!gesture) return;
+    if (gesture.mode === 'addedText') {
+      const i = state.layers.indexOf(gesture.layer);
+      if (i >= 0) state.layers.splice(i, 1);
+      state.activeText = null;
+      $('textPanel').hidden = true;
+    } else if (gesture.mode === 'select') {
+      state.selection = null;
+    } else if (gesture.mode === 'dragSticker') {
+      gesture.layer.x = gesture.sx;
+      gesture.layer.y = gesture.sy;
+    } else if (gesture.mode === 'pan') {
+      state.view = gesture.sv;
+    }
+    gesture = null;
+    render();
+  }
+
+  function beginPinch() {
+    const pts = [...pointers.values()];
+    pinch = {
+      dist: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+      scale: state.view.scale,
+      cx: (pts[0].x + pts[1].x) / 2,
+      cy: (pts[0].y + pts[1].y) / 2,
+    };
+  }
+
+  function updatePinch() {
+    if (!pinch) return;
+    const pts = [...pointers.values()];
+    const cx = (pts[0].x + pts[1].x) / 2;
+    const cy = (pts[0].y + pts[1].y) / 2;
+    const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    const ns = Math.min(8, Math.max(0.2, pinch.scale * d / pinch.dist));
+    const ix = (pinch.cx - state.view.ox) / state.view.scale;
+    const iy = (pinch.cy - state.view.oy) / state.view.scale;
+    state.view.scale = ns;
+    state.view.ox = cx - ix * ns;
+    state.view.oy = cy - iy * ns;
+    render();
+  }
+
+  // ---------- 命中检测 ----------
+  function hitSticker(x, y) {
+    for (let i = state.layers.length - 1; i >= 0; i--) {
+      const l = state.layers[i];
+      if (l.type === 'sticker' && x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h) return l;
+    }
+    return null;
+  }
+  function hitText(x, y) {
+    for (let i = state.layers.length - 1; i >= 0; i--) {
+      const l = state.layers[i];
+      if (l.type !== 'text') continue;
+      dctx.font = `${l.weight} ${l.size}px ${l.family}`;
+      const w = dctx.measureText(l.text).width;
+      if (x >= l.x && x <= l.x + w && y >= l.y && y <= l.y + l.size) return l;
+    }
+    return null;
+  }
+
   // ---------- 抹字 ----------
   function applyErase() {
     const r = state.selection;
     if (!isValidRect(r)) return;
-    // 保存区域快照用于撤销
     const snap = state.baseCtx.getImageData(r.x1, r.y1, r.w, r.h);
     const full = state.baseCtx.getImageData(0, 0, state.imgW, state.imgH);
     const out = eraseRect(full.data, state.imgW, state.imgH, r);
@@ -169,8 +348,7 @@
   // ---------- 文字 ----------
   function addTextAt(x, y) {
     const layer = {
-      type: 'text',
-      x, y,
+      type: 'text', x, y,
       text: $('textContent').value || '文字',
       family: $('textFamily').value,
       weight: $('textWeight').value,
@@ -179,13 +357,24 @@
     };
     state.layers.push(layer);
     state.activeText = layer;
-    $('textWeightVal').textContent = layer.weight;
-    $('textSizeVal').textContent = layer.size;
+    fillPanelFromActive();
     $('textPanel').hidden = false;
     render();
+    return layer;
   }
 
-  // 把输入框当前值写回正在编辑的文字对象
+  function fillPanelFromActive() {
+    const layer = state.activeText;
+    if (!layer) return;
+    $('textContent').value = layer.text;
+    $('textFamily').value = layer.family;
+    $('textWeight').value = layer.weight;
+    $('textSize').value = layer.size;
+    $('textColor').value = layer.color;
+    $('textWeightVal').textContent = layer.weight;
+    $('textSizeVal').textContent = layer.size;
+  }
+
   function syncTextInputs() {
     const layer = state.activeText;
     if (!layer) return;
@@ -197,8 +386,6 @@
     $('textWeightVal').textContent = layer.weight;
     $('textSizeVal').textContent = layer.size;
   }
-
-  // 输入框 → 正在编辑的文字对象（只绑定一次，避免重复绑定）
   ['textContent', 'textFamily', 'textWeight', 'textSize', 'textColor'].forEach((id) => {
     $(id).addEventListener('input', () => { syncTextInputs(); render(); });
   });
@@ -209,21 +396,21 @@
     render();
   });
 
-  // 吸管取色：点画布取原图颜色
+  // 吸管取色
   $('btnPick').addEventListener('click', () => {
     state.picking = true;
     state.tool = 'text';
     document.querySelectorAll('.tool').forEach((b) => b.classList.toggle('active', b.dataset.tool === 'text'));
   });
-  function pickColor(x, y) {
-    const data = state.baseCtx.getImageData(0, 0, state.imgW, state.imgH).data;
-    const p = samplePixel(data, state.imgW, state.imgH, x, y);
-    if (p) {
-      $('textColor').value = rgbaToHex(p[0], p[1], p[2]);
-      if (state.activeText) state.activeText.color = $('textColor').value;
-      render();
-    }
+
+  function pickColorAt(x, y) {
+    // 点在图片外：保持吸管状态，不退出
+    if (x < 0 || y < 0 || x >= state.imgW || y >= state.imgH) return;
+    const d = state.baseCtx.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+    $('textColor').value = rgbaToHex(d[0], d[1], d[2]);
+    if (state.activeText) state.activeText.color = $('textColor').value;
     state.picking = false;
+    render();
   }
 
   // ---------- 贴图 ----------
@@ -240,125 +427,19 @@
 
   function randomizeSticker(sticker) {
     const pos = randomStickerPosition(state.imgW, state.imgH, sticker.w, sticker.h, state.stickerSeed++);
-    sticker.x = pos.x;
-    sticker.y = pos.y;
+    sticker.x = pos.x; sticker.y = pos.y;
     render();
   }
   $('btnRandomPos').addEventListener('click', () => {
     if (state.activeSticker) randomizeSticker(state.activeSticker);
   });
 
-  // ---------- 手势（Pointer Events 统一鼠标/单指触摸） ----------
-  let dragging = null; // { mode: 'pan'|'select'|'sticker', sx, sy, ... }
-
-  canvas.addEventListener('pointerdown', (e) => {
-    const p = screenToImage(e.offsetX, e.offsetY);
-    if (state.picking) { pickColor(p.x, p.y); return; }
-
-    if (state.tool === 'text') {
-      addTextAt(p.x, p.y);
-      return;
-    }
-    if (state.tool === 'sticker') {
-      const hit = hitSticker(p.x, p.y);
-      if (hit) {
-        state.activeSticker = hit;
-        dragging = { mode: 'sticker', layer: hit, dx: p.x - hit.x, dy: p.y - hit.y };
-      } else {
-        state.activeSticker = null;
-        dragging = { mode: 'pan', sx: e.offsetX, sy: e.offsetY, ox: state.view.ox, oy: state.view.oy };
-      }
-      render();
-      return;
-    }
-    if (state.tool === 'pan') {
-      dragging = { mode: 'pan', sx: e.offsetX, sy: e.offsetY, ox: state.view.ox, oy: state.view.oy };
-      return;
-    }
-    // erase：拉矩形选区
-    dragging = { mode: 'select', sx: p.x, sy: p.y };
-    state.selection = null;
-  });
-
-  canvas.addEventListener('pointermove', (e) => {
-    if (!dragging) return;
-    const p = screenToImage(e.offsetX, e.offsetY);
-    if (dragging.mode === 'pan') {
-      state.view.ox = dragging.ox + (e.offsetX - dragging.sx);
-      state.view.oy = dragging.oy + (e.offsetY - dragging.sy);
-      render();
-    } else if (dragging.mode === 'sticker') {
-      dragging.layer.x = p.x - dragging.dx;
-      dragging.layer.y = p.y - dragging.dy;
-      render();
-    } else if (dragging.mode === 'select') {
-      state.selection = normalizeRect(dragging.sx, dragging.sy, p.x, p.y, state.imgW, state.imgH);
-      render();
-    }
-  });
-
-  canvas.addEventListener('pointerup', (e) => {
-    if (!dragging) return;
-    if (dragging.mode === 'select') {
-      applyErase();
-    }
-    dragging = null;
-  });
-
-  function hitSticker(x, y) {
-    for (let i = state.layers.length - 1; i >= 0; i--) {
-      const l = state.layers[i];
-      if (l.type === 'sticker' && x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h) return l;
-    }
-    return null;
-  }
-
-  // 双指缩放画布（touch）
-  let pinch = null;
-  canvas.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 2 && state.imgW) {
-      pinch = {
-        dist: distTouches(e.touches),
-        scale: state.view.scale,
-        cx: (e.touches[0].clientX + e.touches[1].clientX) / 2,
-        cy: (e.touches[0].clientY + e.touches[1].clientY) / 2,
-      };
-      e.preventDefault();
-    }
-  }, { passive: false });
-
-  canvas.addEventListener('touchmove', (e) => {
-    if (pinch && e.touches.length === 2) {
-      const rect = canvas.getBoundingClientRect();
-      const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
-      const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
-      const ns = Math.min(8, Math.max(0.2, pinch.scale * distTouches(e.touches) / pinch.dist));
-      // 以捏合中心为锚缩放
-      const ix = (pinch.cx - rect.left - state.view.ox) / state.view.scale;
-      const iy = (pinch.cy - rect.top - state.view.oy) / state.view.scale;
-      state.view.scale = ns;
-      state.view.ox = cx - ix * ns;
-      state.view.oy = cy - iy * ns;
-      render();
-      e.preventDefault();
-    }
-  }, { passive: false });
-
-  canvas.addEventListener('touchend', () => { pinch = null; });
-
-  function distTouches(ts) {
-    const dx = ts[0].clientX - ts[1].clientX;
-    const dy = ts[0].clientY - ts[1].clientY;
-    return Math.sqrt(dx * dx + dy * dy);
-  }
-
   // ---------- 导出 ----------
   $('btnExport').addEventListener('click', exportImage);
 
   async function exportImage() {
     const out = document.createElement('canvas');
-    out.width = state.imgW;
-    out.height = state.imgH;
+    out.width = state.imgW; out.height = state.imgH;
     const ctx = out.getContext('2d');
     ctx.drawImage(state.baseCanvas, 0, 0);
     for (const layer of state.layers) {
@@ -371,30 +452,19 @@
         ctx.drawImage(layer.img, layer.x, layer.y, layer.w, layer.h);
       }
     }
-
     const mime = outputMimeFromSource(state.sourceMime);
-    const quality = mime === 'image/jpeg' ? 0.92 : undefined;
+    const quality = mime === 'image/jpeg' ? 0.95 : undefined;
     const blob = await new Promise((res) => out.toBlob(res, mime, quality));
     const file = new File([blob], 'result.' + (mime === 'image/png' ? 'png' : 'jpg'), { type: mime });
-
-    // 优先系统分享（iOS 进相册），失败回退下载/长按
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
-      try {
-        await navigator.share({ files: [file] });
-        return;
-      } catch (err) {
-        if (err && err.name === 'AbortError') return;
-        // 分享失败则走下载
-      }
+      try { await navigator.share({ files: [file] }); return; }
+      catch (err) { if (err && err.name === 'AbortError') return; }
     }
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url;
-    a.download = file.name;
-    a.click();
+    a.href = url; a.download = file.name; a.click();
     URL.revokeObjectURL(url);
   }
 
-  // 初始
   render();
 })();

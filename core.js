@@ -108,6 +108,20 @@ function outputMimeFromSource(mime) {
   return mime === 'image/png' ? 'image/png' : 'image/jpeg';
 }
 
+// 用文件头字节判断真实格式（不信 file.type，可能为空或非标准）
+// bytes: Uint8Array，至少前 12 字节
+function detectImageFormat(bytes) {
+  if (bytes && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return 'image/png';
+  if (bytes && bytes[0] === 0xFF && bytes[1] === 0xD8) return 'image/jpeg';
+  return 'image/jpeg'; // 默认按 JPEG 处理
+}
+
+// 边长 + 面积一起卡（iOS 17 canvas 边长上限 4096，面积上限约 4096×4096）
+function calcFitScale(w, h, maxEdge) {
+  const maxArea = maxEdge * maxEdge;
+  return Math.min(1, maxEdge / w, maxEdge / h, Math.sqrt(maxArea / (w * h)));
+}
+
 // ================= 随机（贴图位置） =================
 
 // mulberry32 可复现伪随机
@@ -137,6 +151,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     normalizeRect, isValidRect, clamp255, rgbaToHex, hexToRgb, parseColor,
     samplePixel, eraseRect, edgeVariance, outputMimeFromSource,
+    detectImageFormat, calcFitScale,
     mulberry32, randomStickerPosition
   };
 }

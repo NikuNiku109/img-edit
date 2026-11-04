@@ -7,6 +7,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   background: #1e1e1e;
   color: #eee;
   overscroll-behavior: none;
@@ -63,6 +64,7 @@ body {
   background: #2a2a2a;
   border-top: 1px solid #3a3a3a;
   padding: 10px 12px;
+  padding-bottom: calc(10px + env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -72,7 +74,7 @@ body {
 .panel-row label { font-size: 13px; min-width: 52px; color: #bbb; }
 .panel-row input[type="text"], .panel-row select {
   flex: 1; padding: 6px 8px; border-radius: 6px; border: 1px solid #4a4a4a;
-  background: #1e1e1e; color: #eee; font-size: 14px;
+  background: #1e1e1e; color: #eee; font-size: 16px; /* iOS <16px 会自动放大页面 */
 }
 .panel-row input[type="range"] { flex: 1; }
 .panel-row input[type="color"] { width: 40px; height: 30px; border: none; background: none; }
